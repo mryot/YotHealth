@@ -1,0 +1,16 @@
+# Credentials & Secrets
+.env
+.google_token.json
+client_secret*.json
+
+# Output
+health_export/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# VS Code
+.vscode/
