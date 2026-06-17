@@ -64,8 +64,8 @@ flowchart LR
     APP[("192.168.7.111<br/>App .NET / IIS")]
     VIP_WEB[(VIP 192.168.7.110<br/>Web)]
     VIP_DB[(VIP 192.168.7.114<br/>DB)]
-    DB119[("192.168.7.119 — netkadb01<br/>MariaDB master server_id=1<br/>read_only=OFF<br/>+ nginx + keepalived MASTER<br/>+ NLG Galaxy Docker stack")]
-    DB120[("192.168.7.120 — netkadb02<br/>MariaDB slave server_id=3<br/>read_only=ON<br/>+ nginx + keepalived BACKUP")]
+    DB119[("192.168.7.119 — netkadb01<br/>MariaDB master server_id=3<br/>read_only=OFF<br/>+ nginx + keepalived MASTER<br/>+ NLG Galaxy Docker stack")]
+    DB120[("192.168.7.120 — netkadb02<br/>MariaDB slave server_id=4<br/>read_only=ON<br/>+ nginx + keepalived BACKUP")]
     OLD115[("192.168.7.115 — standby<br/>(rollback)")]
     OLD116[("192.168.7.116 — standby<br/>(rollback)")]
 
