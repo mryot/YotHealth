@@ -2,6 +2,8 @@
 
 > **As-Built Migration Manual** — จัดทำหลังจากดำเนินการ migration จริงสำเร็จแล้ว
 > เอกสารนี้สรุปขั้นตอนตามลำดับที่ทำจริง พร้อมปัญหาที่พบและวิธีแก้ เพื่อให้นำกลับไปใช้ซ้ำหรือใช้เป็น reference สำหรับ migration ครั้งถัดไป
+>
+> **Update ใน Revision 1.1:** เพิ่มแนวทาง hardening สำหรับ migration รอบถัดไป โดยให้ `119` join topology และ sync จาก `115` ให้ครบก่อน cutover แล้วค่อย promote เป็น master
 
 ## 0) Document Control
 
@@ -10,7 +12,7 @@
 | Owner | Infra / DBA Team |
 | ระบบ | Netka Ticket (NetkaQuartz) + NLG Galaxy + nksnms |
 | สถานะ | As-Built (Completed) |
-| Revision | 1.0 (2026-05-15) |
+| Revision | 1.1 (2026-06-17) |
 | ระยะเวลาดำเนินการจริง | ประมาณ 2 สัปดาห์ (เตรียม + cutover + post-fix) |
 | เอกสารอ้างอิง | `Galaxy-Cutover-Runbook-115-116-to-119-120.md`, `MariaDB-HA-Manual.md`, `Nginx-Keepalived-HA-Manual.md`, `MariaDB-Restore-Runbook-ISO27001.md` |
 
@@ -107,7 +109,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     P0[Phase 0<br/>Preconditions & Freeze] --> P1
-    P1[Phase 1<br/>เตรียม MariaDB 119/120<br/>+ Initial Sync 115→120] --> P2
+    P1[Phase 1<br/>เตรียม MariaDB 119/120<br/>+ Initial Sync 115→119<br/>+ Sync 119→120] --> P2
     P2[Phase 2<br/>ติดตั้ง NLG Galaxy บน 119<br/>+ Reset admin + Datasource] --> GATE1{Go/No-Go<br/>Gate 1}
     GATE1 -- No --> ABORT[Abort & Cleanup<br/>119/120 ยังไม่ active]
     GATE1 -- Yes --> P3[Phase 3<br/>Cutover: quiesce 115<br/>→ promote 119<br/>→ ย้าย VIP]
@@ -128,12 +130,13 @@ flowchart LR
       A120[(120<br/>idle)]
     end
     subgraph S1["Step 1 — Initial Sync"]
-      B115[(115 master)] -- mysqldump --> B120[(120 import)]
-      B115 -- replicator --> B120
+            B115[(115 master)] -- mysqldump --> B119[(119 import)]
+            B115 -- replicator --> B119
+            B119 -- replicator --> B120
     end
     subgraph S2["Step 2 — Cutover"]
-      C115[(115 read_only)] --STOP--> C120[(120 catch up)]
-      C119[(119 promote master)] -. new replication .-> C120
+            C115[(115 read_only)] --catch up--> C119[(119 sync complete)]
+            C119[(119 promote master)] -. keep replication .-> C120
     end
     subgraph S3["Step 3 — After"]
       D119[(119 master sid=1<br/>RW)] ==replicate==> D120[(120 slave sid=3<br/>RO)]
@@ -156,7 +159,7 @@ gantt
     section Quiesce
     Stop App pool บน 111         :active, q1, 22:30, 5m
     115 read_only + lock         :active, q2, after q1, 5m
-    Wait 120 catch-up            :active, q3, after q2, 10m
+    Wait 119 catch-up            :active, q3, after q2, 10m
     section Switch
     Promote 119 + change master  :crit, sw1, after q3, 10m
     ย้าย VIP (keepalived)        :crit, sw2, after sw1, 5m
@@ -235,13 +238,14 @@ GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'%';
 FLUSH PRIVILEGES;
 ```
 
-ตรวจจาก 120 ว่าล็อกอินมาที่ 115 ได้:
+ตรวจจาก 119/120 ว่าล็อกอินมาที่ 115 ได้:
 
 ```bash
+ssh yotpet@192.168.7.119 'MYSQL_PWD="Repl!cat0r2026" mysql -ureplicator -h192.168.7.115 -e "SELECT 1"'
 ssh yotpet@192.168.7.120 'MYSQL_PWD="Repl!cat0r2026" mysql -ureplicator -h192.168.7.115 -e "SELECT 1"'
 ```
 
-### 3.4 Initial Sync — Dump 115 → Import 120
+### 3.4 Initial Sync — Dump 115 → Import 119
 
 ```bash
 # บน 115: dump พร้อม master coordinates (รัน local เพื่อหลีกเลี่ยง connection drop)
@@ -256,27 +260,28 @@ ssh netka@192.168.7.115 \
   "grep -m1 'CHANGE MASTER TO MASTER_LOG_FILE' /tmp/full_115_to_120.sql"
 # ตัวอย่าง: MASTER_LOG_FILE='mariadb-bin.000956', MASTER_LOG_POS=803019934
 
-# โอนไป 120
-scp netka@192.168.7.115:/tmp/full_115_to_120.sql yotpet@192.168.7.120:/tmp/
+# โอนไป 119
+scp netka@192.168.7.115:/tmp/full_115_to_120.sql yotpet@192.168.7.119:/tmp/
 
-# Import บน 120
-ssh yotpet@192.168.7.120 'sudo mysql < /tmp/full_115_to_120.sql'
+# Import บน 119
+ssh yotpet@192.168.7.119 'sudo mysql < /tmp/full_115_to_120.sql'
 ```
 
 > **บทเรียน:** ห้ามใช้ `mysqldump -h 192.168.7.115` ข้ามเครื่องโดยตรงสำหรับ DB ขนาด 5GB+ เพราะมักหลุดกลางทาง (`Lost connection`)
 
-### 3.5 ตั้ง 120 เป็น slave ของ 115 (ชั่วคราวระหว่าง migrate)
+### 3.5 ตั้ง 119 เป็น slave ของ 115 (pre-cutover sync)
 
 ```sql
+-- บน 119
 STOP SLAVE;
 RESET SLAVE ALL;
 CHANGE MASTER TO
-  MASTER_HOST='192.168.7.115',
-  MASTER_USER='replicator',
-  MASTER_PASSWORD='Repl!cat0r2026',
-  MASTER_PORT=3306,
-  MASTER_LOG_FILE='mariadb-bin.000956',
-  MASTER_LOG_POS=803019934;
+    MASTER_HOST='192.168.7.115',
+    MASTER_USER='replicator',
+    MASTER_PASSWORD='Repl!cat0r2026',
+    MASTER_PORT=3306,
+    MASTER_LOG_FILE='mariadb-bin.000956',
+    MASTER_LOG_POS=803019934;
 START SLAVE;
 SHOW SLAVE STATUS\G
 ```
@@ -287,7 +292,29 @@ SHOW SLAVE STATUS\G
 - `Seconds_Behind_Master: 0`
 - `Last_IO_Error / Last_SQL_Error` ว่าง
 
-### 3.6 Verify Data Integrity
+### 3.6 ตั้ง 120 เป็น slave ของ 119 (pre-cutover chain)
+
+```sql
+-- บน 120
+STOP SLAVE;
+RESET SLAVE ALL;
+CHANGE MASTER TO
+    MASTER_HOST='192.168.7.119',
+    MASTER_USER='replicator',
+    MASTER_PASSWORD='Repl!cat0r2026',
+    MASTER_PORT=3306,
+    MASTER_USE_GTID=slave_pos;
+START SLAVE;
+SHOW SLAVE STATUS\G
+```
+
+ต้องเห็น:
+- `Slave_IO_Running: Yes`
+- `Slave_SQL_Running: Yes`
+- `Seconds_Behind_Master: 0`
+- `Last_IO_Error / Last_SQL_Error` ว่าง
+
+### 3.7 Verify Data Integrity
 
 ใช้ `CHECKSUM TABLE` ทุก table แล้วเทียบ:
 
@@ -453,10 +480,11 @@ sequenceDiagram
 
     Op->>App: Stop-WebAppPool netkaquartz
     Op->>DB115: FLUSH TABLES WITH READ LOCK<br/>SET GLOBAL read_only=ON
-    Op->>DB120: SHOW SLAVE STATUS<br/>(รอ Seconds_Behind_Master = 0)
-    DB115-->>DB120: replicate ครบ
-    Op->>DB119: SET GLOBAL read_only=OFF<br/>(promote)
-    Op->>DB120: STOP SLAVE; RESET SLAVE ALL<br/>CHANGE MASTER TO 119<br/>START SLAVE
+    Op->>DB119: SHOW SLAVE STATUS<br/>(รอ Seconds_Behind_Master = 0)
+    DB115-->>DB119: replicate ครบ
+    Op->>DB120: SHOW SLAVE STATUS<br/>(ยืนยันยังตาม 119)
+    Op->>DB119: STOP SLAVE; RESET SLAVE ALL<br/>SET GLOBAL read_only=OFF (promote)
+    Op->>DB120: CHANGE MASTER TO 119 (ยืนยัน) <br/>START SLAVE
     Op->>KA: restart keepalived (119/120)
     KA->>VIP: ย้าย VIP มา 119
     Op->>App: Start-WebAppPool (ชี้ DB = VIP 114)
@@ -468,7 +496,8 @@ sequenceDiagram
 
 ทำในช่วง maintenance window:
 
-- [ ] Replication 115 → 120 lag = 0 (`Seconds_Behind_Master: 0`)
+- [ ] Replication 115 → 119 lag = 0 (`Seconds_Behind_Master: 0`)
+- [ ] Replication 119 → 120 lag = 0 (`Seconds_Behind_Master: 0`)
 - [ ] Backup ของ 115 ล่าสุด (ก่อน cutover)
 - [ ] App connection string พร้อมเปลี่ยน (เป้าหมาย = VIP 114)
 - [ ] DNS TTL ลดเป็น 60 วินาที (ทำล่วงหน้า ≥ 24 ชม.)
@@ -486,9 +515,13 @@ ssh netka@192.168.7.115 'sudo mysql -e "FLUSH TABLES WITH READ LOCK; SET GLOBAL 
 Stop-WebAppPool -Name "netkaquartz"
 ```
 
-### 5.3 รอ slave 120 sync จบ
+### 5.3 รอ 119 sync จบ และยืนยัน 120 ยังตาม 119 ได้
 
 ```bash
+ssh yotpet@192.168.7.119 'sudo mysql -e "SHOW SLAVE STATUS\G"' \
+    | egrep 'Master_Host|Seconds_Behind_Master|Read_Master_Log_Pos|Exec_Master_Log_Pos'
+# ต้องได้: Master_Host = 192.168.7.115, Seconds_Behind_Master = 0 และ Read = Exec
+
 ssh yotpet@192.168.7.120 'sudo mysql -e "SHOW SLAVE STATUS\G"' \
   | egrep 'Seconds_Behind_Master|Read_Master_Log_Pos|Exec_Master_Log_Pos'
 # ต้องได้: Seconds_Behind_Master = 0 และ Read = Exec
@@ -497,13 +530,13 @@ ssh yotpet@192.168.7.120 'sudo mysql -e "SHOW SLAVE STATUS\G"' \
 ### 5.4 Promote 119 เป็น Master (เปลี่ยน slave ของ 120 มาเป็น 119)
 
 ```sql
--- บน 119: ทำให้พร้อมเป็น master
+-- บน 119: ตัดการตาม 115 และทำให้พร้อมเป็น master
+STOP SLAVE;
+RESET SLAVE ALL;
 SET GLOBAL read_only=OFF;
 SHOW MASTER STATUS;   -- จดค่า File, Position
 
--- บน 120: เปลี่ยน master จาก 115 → 119
-STOP SLAVE;
-RESET SLAVE ALL;
+-- บน 120: ยืนยันว่า master เป็น 119
 CHANGE MASTER TO
   MASTER_HOST='192.168.7.119',
   MASTER_USER='replicator',
